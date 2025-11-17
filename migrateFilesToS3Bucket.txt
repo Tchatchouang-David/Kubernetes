@@ -1,0 +1,75 @@
+#!/bin/bash
+# --------------------------------------------------------------------------
+# SCRIPT: migrate_media_fixed.sh
+# DESCRIPTION: Transfers files from FTP host to AWS S3 via diskless pipe,
+#              bypassing limited EC2 EBS storage.
+# --------------------------------------------------------------------------
+
+# ============================== CONFIGURATION ==============================
+FTP_USER=""
+FTP_PASS=""
+FTP_HOST=""
+FTP_SOURCE_PATH="/path/on/server/where/media/are/found"
+S3_BUCKET="s3-bucket-name"
+S3_PREFIX="audio"
+
+# ==========================================================================
+
+echo "--- STEP 1: Fetching file list from FTP ---"
+
+# Retrieve file list from FTP
+FILE_LIST=$(lftp -u "$FTP_USER,$FTP_PASS" "$FTP_HOST" <<EOF
+set ftp:ssl-protect-data true
+set ftp:passive-mode true
+cd $FTP_SOURCE_PATH
+cls -1
+bye
+EOF
+)
+
+if [ -z "$FILE_LIST" ]; then
+    echo "ERROR: Could not retrieve file list or directory is empty. Check FTP path: $FTP_SOURCE_PATH"
+    exit 1
+fi
+
+echo "File list retrieved. Starting diskless streaming..."
+
+# ==========================================================================
+
+while IFS= read -r FILE_NAME; do
+    # Skip empty lines
+    [ -z "$FILE_NAME" ] && continue
+    
+    # Check if file already exists in S3
+    S3_PATH="s3://$S3_BUCKET/$S3_PREFIX/$FILE_NAME"
+    if aws s3 ls "$S3_PATH" >/dev/null 2>&1; then
+        echo "SKIPPED: \"$FILE_NAME\" already exists in S3."
+        continue
+    fi
+    
+    echo "--> Streaming \"$FILE_NAME\" to S3..."
+    
+    # Stream file from FTP directly to S3
+    # Using process substitution to properly capture exit codes
+    set -o pipefail
+    
+    lftp -u "$FTP_USER,$FTP_PASS" "$FTP_HOST" <<EOF | aws s3 cp - "$S3_PATH"
+set ftp:ssl-protect-data true
+set ftp:passive-mode true
+set xfer:clobber true
+cd $FTP_SOURCE_PATH
+cat "$FILE_NAME"
+bye
+EOF
+    
+    PIPE_STATUS=$?
+    
+    if [ $PIPE_STATUS -ne 0 ]; then
+        echo "FAILURE: Could not transfer \"$FILE_NAME\" (exit code: $PIPE_STATUS)."
+        continue
+    fi
+    
+    echo "SUCCESS: \"$FILE_NAME\" uploaded."
+done <<< "$FILE_LIST"
+
+echo "--- Migration completed ---"
